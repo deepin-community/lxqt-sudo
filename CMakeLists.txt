@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.1.0 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.18.0 FATAL_ERROR)
 # CMP0000: Call the cmake_minimum_required() command at the beginning of the top-level
 # CMakeLists.txt file even before calling the project() command.
 # The cmake_minimum_required(VERSION) command implicitly invokes the cmake_policy(VERSION)
@@ -15,12 +15,12 @@ set(CMAKE_INCLUDE_CURRENT_DIR ON)
 option(UPDATE_TRANSLATIONS "Update source translation translations/*.ts files" OFF)
 
 # Minimum Versions
-set(LXQT_MINIMUM_VERSION "0.16.0")
-set(QT_MINIMUM_VERSION "5.12.0")
+set(LXQT_MINIMUM_VERSION "2.1.0")
+set(QT_MINIMUM_VERSION "6.6.0")
 
-find_package(Qt5Widgets ${QT_MINIMUM_VERSION} REQUIRED)
+find_package(Qt6Widgets ${QT_MINIMUM_VERSION} REQUIRED)
 find_package(lxqt ${LXQT_MINIMUM_VERSION} REQUIRED)
-message(STATUS "Building with Qt${Qt5Core_VERSION}")
+message(STATUS "Building with Qt${Qt6Core_VERSION}")
 
 # Patch version 0
 
@@ -29,6 +29,7 @@ include(LXQtCompilerSettings NO_POLICY_SCOPE)
 
 set ( LINK_LXSU "lxsu")
 set ( LINK_LXSUDO "lxsudo")
+set ( LINK_LXDOAS "lxdoas")
 
 set ( HDRS
     passworddialog.h
@@ -72,7 +73,7 @@ add_executable(lxqt-sudo
 )
 
 target_link_libraries(lxqt-sudo
-    Qt5::Widgets
+    Qt6::Widgets
     util
     lxqt
     -pthread
@@ -81,32 +82,35 @@ target_link_libraries(lxqt-sudo
 target_compile_definitions(lxqt-sudo
     PRIVATE "LXQTSUDO_SUDO=\"sudo\""
     PRIVATE "LXQTSUDO_SU=\"su\""
+    PRIVATE "LXQTSUDO_DOAS=\"doas\""
     PRIVATE "LXQTSUDO=\"lxqt-sudo\""
     PRIVATE "LXQTSUDO_LXSU=\"${LINK_LXSU}\""
     PRIVATE "LXQTSUDO_LXSUDO=\"${LINK_LXSUDO}\""
+    PRIVATE "LXQTSUDO_LXDOAS=\"${LINK_LXDOAS}\""
     PRIVATE "LXQT_VERSION=\"${LXQT_VERSION}\""
 )
 
-add_custom_command(TARGET lxqt-sudo POST_BUILD
-    COMMAND ln -f -s lxqt-sudo "${LINK_LXSU}"
-    WORKING_DIRECTORY .
-    COMMENT "Creating ${LINK_LXSU} symlink"
-)
-
-add_custom_command(TARGET lxqt-sudo POST_BUILD
-    COMMAND ln -f -s lxqt-sudo "${LINK_LXSUDO}"
-    WORKING_DIRECTORY .
-    COMMENT "Creating ${LINK_LXSUDO} symlink"
-)
+foreach(LINK IN ITEMS ${LINK_LXSU} ${LINK_LXSUDO} ${LINK_LXDOAS})
+    add_custom_command(TARGET lxqt-sudo POST_BUILD
+        COMMAND ln -f -s lxqt-sudo "${LINK}"
+        WORKING_DIRECTORY .
+        COMMENT "Creating ${LINK} symlink"
+    )
+    install(FILES
+        "${CMAKE_CURRENT_BINARY_DIR}/${LINK}"
+        DESTINATION "${CMAKE_INSTALL_BINDIR}"
+        COMPONENT Runtime
+    )
+    install(FILES
+        "man/${LINK}.1"
+        DESTINATION "${CMAKE_INSTALL_MANDIR}/man1"
+        COMPONENT Runtime
+    )
+endforeach()
 
 install(TARGETS
     lxqt-sudo
     RUNTIME DESTINATION "${CMAKE_INSTALL_BINDIR}"
-    COMPONENT Runtime
-)
-install(FILES
-    "${CMAKE_CURRENT_BINARY_DIR}/${LINK_LXSU}" "${CMAKE_CURRENT_BINARY_DIR}/${LINK_LXSUDO}"
-    DESTINATION "${CMAKE_INSTALL_BINDIR}"
     COMPONENT Runtime
 )
 install(FILES
@@ -115,7 +119,7 @@ install(FILES
     COMPONENT Runtime
 )
 install(FILES
-    man/lxqt-sudo.1 "man/${LINK_LXSU}.1" "man/${LINK_LXSUDO}.1"
+    man/lxqt-sudo.1
     DESTINATION "${CMAKE_INSTALL_MANDIR}/man1"
     COMPONENT Runtime
 )
