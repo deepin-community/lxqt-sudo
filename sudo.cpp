@@ -61,11 +61,14 @@ namespace
     const QString app_version{QStringLiteral(LXQT_VERSION)};
     const QString app_lxsu{QStringLiteral(LXQTSUDO_LXSU)};
     const QString app_lxsudo{QStringLiteral(LXQTSUDO_LXSUDO)};
+    const QString app_lxdoas{QStringLiteral(LXQTSUDO_LXDOAS)};
 
     const QString su_prog{QStringLiteral(LXQTSUDO_SU)};
     const QString sudo_prog{QStringLiteral(LXQTSUDO_SUDO)};
+    const QString doas_prog{QStringLiteral(LXQTSUDO_DOAS)};
     const QString pwd_prompt_end{QStringLiteral(": ")};
     const QChar nl{QLatin1Char('\n')};
+    constexpr int term_eol_size = 2;
 
     void usage(QString const & err = QString())
     {
@@ -73,15 +76,16 @@ namespace
             QTextStream(stderr) << err << '\n';
         QTextStream(stdout)
             << QObject::tr("Usage: %1 option [command [arguments...]]\n\n"
-                    "GUI frontend for %2/%3\n\n"
+                    "GUI frontend for %2/%3/%4\n\n"
                     "Arguments:\n"
                     "  option:\n"
                     "    -h|--help      Print this help.\n"
                     "    -v|--version   Print version information.\n"
                     "    -s|--su        Use %3(1) as backend.\n"
                     "    -d|--sudo      Use %2(8) as backend.\n"
+                    "    -a|--doas      Use %4(1) as backend.\n"
                     "  command          Command to run.\n"
-                    "  arguments        Optional arguments for command.\n\n").arg(app_master).arg(sudo_prog).arg(su_prog);
+                    "  arguments        Optional arguments for command.\n\n").arg(app_master).arg(sudo_prog).arg(su_prog).arg(doas_prog);
         if (!err.isEmpty())
             QMessageBox(QMessageBox::Critical, app_master, err, QMessageBox::Ok).exec();
     }
@@ -94,10 +98,10 @@ namespace
 
     //Note: array must be sorted to allow usage of binary search
     static constexpr char const * const ALLOWED_VARS[] = {
-        "DISPLAY"
+        "DISPLAY", "GDK_DPI_SCALE", "GDK_SCALE", "GTK_CSD", "GTK_OVERLAY_SCROLLING"
             , "LANG", "LANGUAGE", "LC_ADDRESS", "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_IDENTIFICATION", "LC_MEASUREMENT"
             , "LC_MESSAGES", "LC_MONETARY", "LC_NAME", "LC_NUMERIC", "LC_PAPER", "LC_TELEPHONE", "LC_TIME"
-            , "PATH", "QT_PLATFORM_PLUGIN", "QT_QPA_PLATFORMTHEME", "TERM", "WAYLAND_DISPLAY", "XAUTHLOCALHOSTNAME", "XAUTHORITY"
+            , "PATH", "QT_PLATFORM_PLUGIN", "QT_QPA_PLATFORMTHEME", "QT_SCALE_FACTOR", "TERM", "WAYLAND_DISPLAY", "XAUTHLOCALHOSTNAME", "XAUTHORITY"
     };
     static constexpr char const * const * const ALLOWED_END = ALLOWED_VARS + sizeof (ALLOWED_VARS) / sizeof (ALLOWED_VARS[0]);
     struct assert_helper
@@ -155,6 +159,8 @@ Sudo::Sudo()
     mArgs.removeAt(0);
     if (app_lxsu == cmd)
         mBackend = BACK_SU;
+    else if (app_lxdoas == cmd)
+        mBackend = BACK_DOAS;
     else if (app_lxsudo == cmd || app_master == cmd)
         mBackend = BACK_SUDO;
     mRet = mPwdFd = mChildPid = 0;
@@ -186,6 +192,10 @@ int Sudo::main()
         {
             mBackend = BACK_SUDO;
             mArgs.removeAt(0);
+        } else if (QStringLiteral("-a") == arg1 || QStringLiteral("--doas") == arg1)
+        {
+            mBackend = BACK_DOAS;
+            mArgs.removeAt(0);
         }
     }
     //any other arguments we simply forward to su/sudo
@@ -212,7 +222,7 @@ int Sudo::main()
 
     mDlg.reset(new PasswordDialog{squashedArgs(/*userFriendly = */ true), backendName()});
     mDlg->setModal(true);
-    lxqtApp->setActiveWindow(mDlg.data());
+    mDlg.data()->activateWindow();
 
     if (-1 == mChildPid)
         QMessageBox(QMessageBox::Critical, mDlg->windowTitle()
@@ -242,6 +252,7 @@ QString Sudo::backendName (backend_t backEnd)
     switch (backEnd) {
         case BACK_SU   : rv = su_prog;   break;
         case BACK_SUDO : rv = sudo_prog; break;
+        case BACK_DOAS : rv = doas_prog; break;
         //: shouldn't be actually used but keep as short as possible in translations just in case.
         case BACK_NONE : rv = tr("unset");
     }
@@ -251,8 +262,22 @@ QString Sudo::backendName (backend_t backEnd)
 
 void Sudo::child()
 {
-    int params_cnt = 3 //1. su/sudo & "shell command" & last nullptr
-        + (BACK_SU == mBackend ? 1 : 3); //-c for su | -E /bin/sh -c for sudo
+    int params_cnt = 3; //su/sudo & "shell command" & last nullptr
+    switch (mBackend)
+    {
+        case BACK_SU:
+            params_cnt += 1; // -c for su
+            break;
+        case BACK_SUDO:
+            params_cnt += 3; // --preserve-env=... /bin/sh -c for sudo
+            break;
+        case BACK_DOAS:
+            params_cnt += 2; // /bin/sh -c for sudo
+            break;
+        case BACK_NONE:
+            break;
+    }
+
     std::unique_ptr<char const *[]> params{new char const *[params_cnt]};
     const char ** param_arg = params.get() + 1;
 
@@ -269,6 +294,9 @@ void Sudo::child()
             *(param_arg++) = preserve_env_param.c_str(); //preserve environment
             *(param_arg++) = "/bin/sh";
             break;
+        case BACK_DOAS:
+            *(param_arg++) = "/bin/sh";
+            [[fallthrough]];
         case BACK_SU:
         case BACK_NONE:
             env_workarounds();
@@ -347,12 +375,14 @@ int Sudo::parent()
     }
 
     QTextStream child_str{pwd_f};
+    // pseudoterminal echoes everything written into it's input; we don't want duplicating input
+    int inhibit_count = 0;
 
     QObject::connect(mDlg.data(), &QDialog::finished, [&] (int result)
         {
             if (QDialog::Accepted == result)
             {
-                child_str << mDlg->password().append(nl);
+                child_str << mDlg->password() << nl;
                 child_str.flush();
             } else
             {
@@ -361,6 +391,8 @@ int Sudo::parent()
         });
 
     QString last_line;
+    QString const & error_check = QStringLiteral("%1:").arg(backendName());
+    QTextStream stderr_str{stderr, QIODevice::WriteOnly};
     QScopedPointer<QSocketNotifier> pwd_watcher{new QSocketNotifier{mPwdFd, QSocketNotifier::Read}};
     auto reader = [&]
         {
@@ -369,11 +401,10 @@ int Sudo::parent()
             {
                 pwd_watcher.reset(nullptr); //stop the notifications events
 
-                QString const & prog = backendName();
-                if (last_line.startsWith(QStringLiteral("%1:").arg(prog)))
+                if (last_line.startsWith(error_check))
                 {
                     QMessageBox(QMessageBox::Critical, mDlg->windowTitle()
-                            , tr("Child '%1' process failed!\n%2").arg(prog).arg(last_line), QMessageBox::Ok).exec();
+                            , tr("Child '%1' process failed!\n%2").arg(backendName()).arg(last_line), QMessageBox::Ok).exec();
                 }
             } else
             {
@@ -387,18 +418,56 @@ int Sudo::parent()
                     if (!(ECHO & tios.c_lflag))
                     {
                         mDlg->show();
-                        return;
                     }
                 }
-                QTextStream{stderr, QIODevice::WriteOnly} << line;
-                //assuming text oriented output
-                QStringList lines = line.split(nl, QString::SkipEmptyParts);
-                last_line = lines.isEmpty() ? QString() : lines.back();
+                if (inhibit_count > 0)
+                {
+                    if (inhibit_count < line.size())
+                    {
+                        stderr_str << line.right(line.size() - inhibit_count);
+                        stderr_str.flush();
+                        inhibit_count = 0;
+                    } else
+                    {
+                        inhibit_count -= line.size();
+                    }
+                } else
+                {
+                    stderr_str << line;
+                    stderr_str.flush();
+                }
+
+                //assuming text oriented output; find the last non-empty line
+                auto i = line.crbegin(), i_end = line.crbegin(), i_crend = line.crend();
+                do {
+                    i_end = i + 1;
+                    i = std::find(i_end, i_crend, nl);
+                } while (i != i_crend && std::distance(i, i_end) == 0);
+
+                last_line.clear();
+                last_line.reserve(std::distance(i, i_end));
+                std::for_each(i.base(), i_end.base(), [&last_line](decltype (*i.base()) val) { last_line.append(val); });
             }
 
         };
 
+    QTextStream stdin_str{stdin, QIODevice::ReadOnly};
+    QScopedPointer<QSocketNotifier> stdin_watcher{new QSocketNotifier{STDIN_FILENO, QSocketNotifier::Read}};
+    auto writer = [&]
+    {
+        QString line = stdin_str.readLine();
+        if (line.isEmpty()) {
+            stdin_watcher.reset(nullptr); //stop the notification events
+        } else
+        {
+            inhibit_count += line.size() + term_eol_size;
+            child_str << line << nl;
+            child_str.flush();
+        }
+    };
+
     QObject::connect(pwd_watcher.data(), &QSocketNotifier::activated, reader);
+    QObject::connect(stdin_watcher.data(), &QSocketNotifier::activated, writer);
 
     std::unique_ptr<std::thread> child_waiter;
     QTimer::singleShot(0, [&child_waiter, this] {
